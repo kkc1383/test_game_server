@@ -1,0 +1,4 @@
+C:\Users\kangk\OneDrive\Desktop\Krafton_jungle\GameServer\x64\Release\PhysX_64.dll
+C:\Users\kangk\OneDrive\Desktop\Krafton_jungle\GameServer\x64\Release\PhysXCommon_64.dll
+C:\Users\kangk\OneDrive\Desktop\Krafton_jungle\GameServer\x64\Release\PhysXFoundation_64.dll
+C:\Users\kangk\OneDrive\Desktop\Krafton_jungle\GameServer\GameServer\x64\Release\GameServ.BF9563D1.Up2Date
