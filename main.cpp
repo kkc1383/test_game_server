@@ -3,6 +3,9 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/post.hpp>
 #include <thread>
 #include <memory>
 #include <string>
@@ -33,12 +36,24 @@ private:
 	beast::flat_buffer buffer_;
 	int playerId_;
 	string nickname_;
-	GameServer* server_;
+	GameServer *server_;
 	bool isAlive_;
 	bool hasJoined_; // JOIN_REQUEST를 받았는지 확인
+
+	net::strand<net::io_context::executor_type> strand_;
+	vector<string> writeQueue_;
+	mutex queueMutex_;
+	bool isWriting_ = false;
+	string curentWriteMessage_;
+
 public:
-	Session(tcp::socket socket, GameServer* server)
-		: ws_(move(socket)), playerId_(-1), server_(server), isAlive_(true), hasJoined_(false)
+	Session(tcp::socket socket, GameServer *server, net::io_context &ioc)
+		: ws_(move(socket)),
+		playerId_(-1),
+		server_(server),
+		isAlive_(true),
+		hasJoined_(false),
+		strand_(net::make_strand(ioc.get_executor()))
 	{
 	}
 
@@ -50,15 +65,18 @@ public:
 	void run()
 	{
 		//websocket 핸드셰이크
+		//모든 비동기 작업을 strand_를 통해 실행하도록 bind_executor 사용추가
 		ws_.async_accept(
-			[self = shared_from_this()](beast::error_code ec)
-			{
-				if (!ec)
+			net::bind_executor(strand_,
+				[self = shared_from_this()](beast::error_code ec)
 				{
-					cout << "Client connected, waiting for JOIN_REQUEST..." << endl;
-					self->doRead();
-				}
-			});
+					if (!ec)
+					{
+						cout << "Client connected, waiting for JOIN_REQUEST..." << endl;
+						self->doRead();
+					}
+				})
+		);
 	}
 
 	void sendJoinResponse(bool success, int playerId, string nickname, string message = "")
@@ -82,52 +100,102 @@ public:
 
 	void doRead()
 	{
+		// 읽기 작업도 strand_를 통해 실행추가
 		ws_.async_read(
 			buffer_,
-			[self = shared_from_this()](beast::error_code ec, size_t bytes)
-			{
-				if (!ec)
+			net::bind_executor(strand_,
+				[self = shared_from_this()](beast::error_code ec, size_t bytes)
 				{
-					//받은 메시지 처리
-					string message = beast::buffers_to_string(self->buffer_.data());
-					self->buffer_.consume(self->buffer_.size());
-
-					self->handleMessage(message);
-					self->doRead();
-				}
-				else
-				{
-					if (self->hasJoined_)
+					if (!ec)
 					{
-						cout << "Player " << self->playerId_ << " (" << self->nickname_ << ") disconnected" << endl;
+						//받은 메시지 처리
+						string message = beast::buffers_to_string(self->buffer_.data());
+						self->buffer_.consume(self->buffer_.size());
+
+						self->handleMessage(message);
+						self->doRead();
 					}
 					else
 					{
-						cout << "Client disconnected before joining" << endl;
+						if (self->hasJoined_)
+						{
+							cout << "Player " << self->playerId_ << " (" << self->nickname_ << ") disconnected" << endl;
+						}
+						else
+						{
+							cout << "Client disconnected before joining" << endl;
+						}
+						self->isAlive_ = false;
 					}
-					self->isAlive_ = false;
-				}
-			});
+				})
+		);
 	}
 
-	void send(const string& message)
+	// 비동기 큐 구현
+	void send(const string &message)
 	{
-		try
+		bool startWrite = false;
+		// 큐는 락걸고 작업해야하니 스코프안에서
 		{
-			if (ws_.is_open())
+			lock_guard<mutex> lock(queueMutex_);
+			writeQueue_.push_back(message);
+
+			if (!isWriting_)
 			{
-				ws_.text(true);
-				ws_.write(net::buffer(message));
+				isWriting_ = true;
+				startWrite = true;
 			}
 		}
-		catch (const exception& e)
+
+		if (startWrite)
 		{
-			cerr << "Send error: " << e.what() << endl;
-			isAlive_ = false;
+			net::post(strand_, [self = shared_from_this()]() {
+				self->doWrite();
+				});
 		}
 	}
 
-	void handleMessage(const string& message); // 전방 선언
+private:
+	// 비동기 쓰기 루프
+	void doWrite()
+	{
+		// 큐는 락걸고 작업해야하니 스코프안에서
+		{
+			lock_guard<mutex> lock(queueMutex_);
+
+			// 큐가 비면 쓰기 종료후 리턴
+			if (writeQueue_.empty())
+			{
+				isWriting_ = false;
+				return;
+			}
+
+			curentWriteMessage_ = std::move(writeQueue_.front());
+			writeQueue_.erase(writeQueue_.begin());
+		}
+
+		ws_.text(true);
+		ws_.async_write(
+			net::buffer(curentWriteMessage_),
+			net::bind_executor(strand_,
+				[self = shared_from_this()](beast::error_code ec, size_t bytes)
+				{
+					if (!ec)
+					{
+						// 다음 메시지 전송
+						self->doWrite();
+					}
+					else
+					{
+						cerr << "Send error: " << ec.message() << endl;
+						self->isAlive_ = false;
+					}
+				})
+		);
+	}
+
+public:
+	void handleMessage(const string &message); // 전방 선언
 	void sendGameState(); // 전방 선언
 };
 
@@ -154,6 +222,7 @@ private:
 	float currentTPS_ = 0.0f;
 
 	thread gameLoopThread_;
+	vector<thread> iocThreads_;
 	atomic<bool> running_;
 
 	int broadcaseCounter_ = 0;
@@ -164,7 +233,7 @@ private:
 		data["type"] = 4; // GAME_STATE
 
 		json playersArray = json::array();
-		for (const auto& player : gameWorld_.getPlayers())
+		for (const auto &player : gameWorld_.getPlayers())
 		{
 			if (player != nullptr)
 			{
@@ -181,7 +250,7 @@ private:
 
 		// 더미 배열 추가
 		json dummiesArray = json::array();
-		for (const auto& dummy : gameWorld_.getDummies())
+		for (const auto &dummy : gameWorld_.getDummies())
 		{
 			json d;
 			d["id"] = dummy->id;
@@ -219,7 +288,29 @@ public:
 
 	void run()
 	{
+		// CPU 코어 수 만큼 I/O 스레드 생성 예정
+		auto const thread_count = std::max<int>(1, std::thread::hardware_concurrency());
+		cout << "Starting " << thread_count << " I/O threads" << endl;
+
+		iocThreads_.reserve(thread_count - 1);
+
+		// I/O 스레드 실제 생성 (N-1개)
+		for (int i = 0; i < thread_count - 1; ++i)
+		{
+			iocThreads_.emplace_back([this] {
+				ioc_.run();
+				});
+		}
+
+		// N번째는 메인 스레드
 		ioc_.run();
+
+		// 서버 종료시 모든 스레드 수거
+		for (auto &t : iocThreads_)
+		{
+			if (t.joinable())
+				t.join();
+		}
 	}
 
 	void stop()
@@ -229,6 +320,11 @@ public:
 		{
 			gameLoopThread_.join();
 		}
+
+		if (!ioc_.stopped())
+		{
+			ioc_.stop();
+		}
 	}
 
 	int joinPlayer(string nickname, Color color)
@@ -237,7 +333,7 @@ public:
 		return gameWorld_.addPlayer(nickname, color);
 	}
 
-	void setPlayerInput(int playerId, const Vector3& movement)
+	void setPlayerInput(int playerId, const Vector3 &movement)
 	{
 		lock_guard<mutex> lock(worldMutex_);
 		gameWorld_.setPlayerInput(playerId, movement);
@@ -283,10 +379,10 @@ public:
 		return getGameStateInternal();
 	}
 
-	void broadcast(const string& message)
+	void broadcast(const string &message)
 	{
 		lock_guard<mutex> lock(sessionsMutex_);
-		for (auto& session : sessions_)
+		for (auto &session : sessions_)
 		{
 			if (session->isAlive() && session->hasJoined())
 			{
@@ -299,7 +395,7 @@ public:
 	{
 		lock_guard<mutex> lock(sessionsMutex_);
 		int count = 0;
-		for (auto& session : sessions_)
+		for (auto &session : sessions_)
 		{
 			if (session->hasJoined())
 			{
@@ -318,7 +414,7 @@ private:
 				if (!ec)
 				{
 					// 세션만 생성, playerId는 JOIN_REQUEST에서 할당
-					auto session = make_shared<Session>(move(socket), this);
+					auto session = make_shared<Session>(move(socket), this, ioc_);
 					{
 						lock_guard<mutex> lock(sessionsMutex_);
 						sessions_.push_back(session);
@@ -414,7 +510,7 @@ private:
 
 			// 서버 정보 출력
 			cout << "=== Game Server Status ===" << endl;
-			cout << "TPS: " << fixed << setprecision(1) << currentTPS_<< endl;
+			cout << "TPS: " << fixed << setprecision(1) << currentTPS_ << endl;
 			cout << "Tick Time: " << fixed << setprecision(2)
 				<< (1000.0f / currentTPS_) << " ms" << endl;
 
@@ -443,7 +539,7 @@ void Session::sendGameState()
 	send(gameState.dump());
 }
 
-void Session::handleMessage(const string& message)
+void Session::handleMessage(const string &message)
 {
 	try
 	{
@@ -487,7 +583,7 @@ void Session::handleMessage(const string& message)
 				sendJoinResponse(true, playerId_, nickname_);
 
 				// 초기 게임 상태 전송
-				this_thread::sleep_for(chrono::milliseconds(100));
+				this_thread::sleep_for(chrono::milliseconds(100)); // ?? 왜 잠드는 것인지 ??
 				sendGameState();
 			}
 			else
@@ -575,7 +671,7 @@ void Session::handleMessage(const string& message)
 			break;
 		}
 	}
-	catch (const exception& e)
+	catch (const exception &e)
 	{
 		cerr << "Message parse error: " << e.what() << endl;
 	}
@@ -589,7 +685,7 @@ int main()
 		server.start();
 		server.run();
 	}
-	catch (const exception& e)
+	catch (const exception &e)
 	{
 		cerr << "Fatal Error: " << e.what() << endl;
 		return 1;
